@@ -38,6 +38,10 @@ TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 DATE_RE = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}$")
 DURATION_RE = re.compile(r"^\d+\s*h(?:\s*\d+\s*m)?$", re.IGNORECASE)
 PRICE_RE = re.compile(r"^(₹|Rs\.?\s*)([\d,]+)$", re.IGNORECASE)
+FARE_CLASS_RE = re.compile(
+	r"\b(Premium Economy|Economy|Business)\b",
+	re.IGNORECASE,
+)
 
 
 def _departure_date(value: str, today: date) -> date:
@@ -48,11 +52,23 @@ def _departure_date(value: str, today: date) -> date:
 	return candidate
 
 
-def parse_flight_text(text: str, today: date | None = None) -> list[dict[str, str | int | bool]]:
+def _available_fare_classes(text: str) -> str:
+	fare_classes = []
+	for match in FARE_CLASS_RE.finditer(text):
+		fare_class = match.group(1).title()
+		if fare_class not in fare_classes:
+			fare_classes.append(fare_class)
+	return ", ".join(fare_classes)
+
+
+def parse_flight_text(
+	text: str,
+	today: date | None = None,
+	fare_class: str | None = None,
+) -> list[dict[str, str | int | bool]]:
 	today = today or date.today()
 	lines = [line.strip() for line in text.splitlines() if line.strip()]
-	fare_match = re.search(r"\d+\s+Traveller[s]?,\s*(.+)", text, re.IGNORECASE)
-	fare_class = fare_match.group(1).strip() if fare_match else ""
+	fare_class = fare_class or _available_fare_classes(text)
 	scrape_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
 	rows = []
 
