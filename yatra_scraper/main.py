@@ -24,17 +24,19 @@ AIRPORTS = ("DEL", "BOM", "BLR", "CCU", "HYD", "MAA")
 AIRPORT_SEARCH_TERMS = {
 	"DEL": "New Delhi",
 	"BOM": "Mumbai",
-	"BLR": "Bengaluru",
+	"BLR": "Bangalore",
 	"CCU": "Kolkata",
 	"HYD": "Hyderabad",
 	"MAA": "Chennai",
 }
 FARE_CLASSES = ("Economy", "Business")
-DATE_COUNT = 45
-EXPECTED_PERMUTATION_COUNT = 2700
+DATE_OFFSETS = (0, 6, 14, 29, 44)
+EXPECTED_PERMUTATION_COUNT = (
+	len(AIRPORTS) * (len(AIRPORTS) - 1) * len(DATE_OFFSETS) * len(FARE_CLASSES)
+)
 
 HEADLESS_BROWSER = False
-BROWSER_SLOW_MO_MS = 2000
+BROWSER_SLOW_MO_MS = 0
 PAGE_LOAD_TIMEOUT_MS = 30000
 ELEMENT_TIMEOUT_MS = 15000
 CHALLENGE_TIMEOUT_SECONDS = 30
@@ -45,14 +47,14 @@ SCROLL_WAIT_MS = 700
 RESULTS_WAIT_MS = 1500
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
-REQUEST_DELAY_MIN_SECONDS = 30
-REQUEST_DELAY_MAX_SECONDS = 60
+REQUEST_DELAY_MIN_SECONDS = 10
+REQUEST_DELAY_MAX_SECONDS = 15
 DEPARTURE_DATE_INPUT_SELECTOR = '[aria-label="Departure date inputbox"]'
 
 OUTPUT_CSV_PATH = Path("Yatra_data.csv")
 CHECKPOINT_PATH = Path("yatra_scraper_checkpoint.json")
 PAUSE_FILE_PATH = Path("pause_scraper.pause")
-PAUSE_POLL_INTERVAL_SECONDS = 5
+PAUSE_POLL_INTERVAL_SECONDS = 0.25
 
 USER_AGENTS = (
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -128,7 +130,17 @@ class PauseController:
 		while self.paused.is_set() or PAUSE_FILE_PATH.exists():
 			if self.stopped.is_set():
 				return
-			time.sleep(PAUSE_POLL_INTERVAL_SECONDS)
+			self.stopped.wait(PAUSE_POLL_INTERVAL_SECONDS)
+
+	def wait_for_delay(self, seconds: float) -> bool:
+		deadline = time.monotonic() + seconds
+		while time.monotonic() < deadline:
+			self.wait_if_paused()
+			if self.stopped.is_set():
+				return False
+			remaining = deadline - time.monotonic()
+			self.stopped.wait(min(remaining, PAUSE_POLL_INTERVAL_SECONDS))
+		return not self.stopped.is_set()
 
 	def stop(self) -> None:
 		self.stopped.set()
@@ -153,7 +165,7 @@ def generate_search_parameters(start_date: date) -> list[SearchParameters]:
 		for destination in AIRPORTS:
 			if origin == destination:
 				continue
-			for day_offset in range(DATE_COUNT):
+			for day_offset in DATE_OFFSETS:
 				for fare_class in FARE_CLASSES:
 					parameters.append(
 						SearchParameters(
@@ -471,7 +483,12 @@ def wait_if_paused() -> None:
 	print("Pause file removed; resuming.")
 
 
-def scrape_with_retries(browser, parameters: SearchParameters, request_number: int) -> int:
+def scrape_with_retries(
+	browser,
+	parameters: SearchParameters,
+	request_number: int,
+	controller: PauseController,
+) -> int:
 	for attempt in range(1, MAX_RETRIES + 1):
 		delay = random.uniform(
 			REQUEST_DELAY_MIN_SECONDS,
@@ -481,7 +498,8 @@ def scrape_with_retries(browser, parameters: SearchParameters, request_number: i
 			f"Waiting {delay:.1f} seconds before request "
 			f"{request_number}, attempt {attempt}."
 		)
-		time.sleep(delay)
+		if not controller.wait_for_delay(delay):
+			return 0
 
 		user_agent = USER_AGENTS[(request_number + attempt - 2) % len(USER_AGENTS)]
 		context = browser.new_context(user_agent=user_agent)
@@ -505,7 +523,8 @@ def scrape_with_retries(browser, parameters: SearchParameters, request_number: i
 				return 0
 			backoff = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
 			print(f"Attempt {attempt} failed; retrying in {backoff} seconds: {error}")
-			time.sleep(backoff)
+			if not controller.wait_for_delay(backoff):
+				return 0
 		finally:
 			context.close()
 	return 0
@@ -552,8 +571,11 @@ def run_scraper(controller: PauseController) -> None:
 				browser,
 				search_parameters,
 				request_number,
+				controller,
 			)
-			controller.set_status("Running")
+			if controller.stopped.is_set():
+				save_checkpoint(start_date, request_number, parameters)
+				return
 			print(
 				f"Completed {request_number}/{len(parameters)}: "
 				f"{search_parameters.origin}-{search_parameters.destination}, "
