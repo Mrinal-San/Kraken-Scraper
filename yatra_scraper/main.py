@@ -55,6 +55,7 @@ OUTPUT_CSV_PATH = Path("Yatra_data.csv")
 CHECKPOINT_PATH = Path("yatra_scraper_checkpoint.json")
 PAUSE_FILE_PATH = Path("pause_scraper.pause")
 PAUSE_POLL_INTERVAL_SECONDS = 0.25
+CHECKPOINT_RETRY_DELAY_SECONDS = 60
 
 USER_AGENTS = (
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -449,6 +450,16 @@ def save_checkpoint(
 	temporary_path.replace(CHECKPOINT_PATH)
 
 
+def is_checkpoint_access_denied(error: OSError) -> bool:
+	return (
+		getattr(error, "winerror", None) == 5
+		and error.filename is not None
+		and error.filename2 is not None
+		and Path(error.filename).name == "yatra_scraper_checkpoint.tmp"
+		and Path(error.filename2).name == "yatra_scraper_checkpoint.json"
+	)
+
+
 def load_checkpoint(
 	default_start_date: date,
 	total_iterations: int,
@@ -602,15 +613,27 @@ def run_scraper(controller: PauseController) -> None:
 
 
 def run_scraper_safely(controller: PauseController) -> None:
-	try:
-		run_scraper(controller)
-	except Exception as error:
-		print(f"Scraper stopped unexpectedly: {error}")
-		controller.set_status(f"Stopped: {error}")
+	while not controller.stopped.is_set():
 		try:
-			controller.root.after(0, controller.root.destroy)
-		except tk.TclError:
-			pass
+			run_scraper(controller)
+			return
+		except Exception as error:
+			if is_checkpoint_access_denied(error):
+				print(
+					"Windows denied access while replacing the checkpoint. "
+					f"Restarting the scraper in {CHECKPOINT_RETRY_DELAY_SECONDS} seconds."
+				)
+				controller.set_status("Checkpoint access denied; retrying in 60 seconds")
+				if controller.wait_for_delay(CHECKPOINT_RETRY_DELAY_SECONDS):
+					continue
+				return
+			print(f"Scraper stopped unexpectedly: {error}")
+			controller.set_status(f"Stopped: {error}")
+			try:
+				controller.root.after(0, controller.root.destroy)
+			except tk.TclError:
+				pass
+			return
 
 
 def main() -> None:

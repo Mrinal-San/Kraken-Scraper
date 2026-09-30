@@ -8,17 +8,18 @@ The scraper is designed for long-running jobs. It provides a desktop Pause/Play 
 
 - Scrapes all origin and destination permutations for the configured airports.
 - Excludes same-airport routes such as `DEL -> DEL`.
-- Covers 45 consecutive departure dates beginning tomorrow.
+- Covers five departure dates at T+1, T+7, T+15, T+30, and T+45 days.
 - Selects Economy and Business fares. Premium Economy is intentionally excluded to reduce the number of requests.
-- Generates `30 routes x 45 dates x 2 fare classes = 2,700 requests`.
+- Generates `30 routes x 5 dates x 2 fare classes = 300 requests`.
 - Uses a visible Firefox browser so challenges can be handled manually when necessary.
 - Rotates User-Agent values between request attempts.
-- Applies a random 30-to-60-second delay before each request attempt.
+- Applies a random 10-to-15-second delay before each request attempt.
 - Retries failed requests up to three times with exponential backoff.
 - Detects HTTP 403 and 429 responses as retryable failures.
 - Scrolls through result pages and extracts loaded flight rows.
 - Appends successful results to `Yatra_data.csv` immediately.
 - Saves the next route, date, fare class, and iteration in a checkpoint file.
+- Retries automatically after a Windows permission error prevents checkpoint replacement.
 - Provides a Pause/Play desktop window that remains responsive while scraping.
 - Supports a file-based pause mechanism for unattended operation.
 
@@ -85,17 +86,18 @@ The generated order is deterministic:
 ```text
 Origin airport
   Destination airport
-    Date 1: Economy, Business
-    Date 2: Economy, Business
-    ...
-    Date 45: Economy, Business
+    T+1: Economy, Business
+    T+7: Economy, Business
+    T+15: Economy, Business
+    T+30: Economy, Business
+    T+45: Economy, Business
 ```
 
-Same-airport routes are skipped. For six airports, this produces 30 valid routes. The total is therefore 2,700 requests.
+  The schedule starts tomorrow (T+1). Same-airport routes are skipped. For six airports, this produces 30 valid routes, or 300 requests total.
 
 ## Pause and Play
 
-Use the **Pause** button in the desktop window to pause before the next request. The current request is allowed to finish cleanly. Press **Play** to continue.
+Use the **Pause** button in the desktop window to pause during the wait before a request. The current request is allowed to finish cleanly. Press **Play** to continue.
 
 For a file-based pause, create this file from PowerShell:
 
@@ -142,6 +144,8 @@ The scraper resumes from the checkpoint. The original start date is preserved ev
 
 When all permutations finish, the checkpoint is deleted automatically.
 
+On Windows, another process or security tool can temporarily prevent the checkpoint file from being replaced. When this specific permission error occurs, the scraper waits 60 seconds and retries automatically. Keep the scraper running while it recovers; the desktop status and terminal output indicate the retry.
+
 To deliberately start a completely new run, remove the checkpoint before launching:
 
 ```powershell
@@ -173,17 +177,34 @@ The output contains flight details such as:
 
 Rows are written after each successful permutation, reducing data loss if the job stops later.
 
+## Convert Flight Text to CSV
+
+The `yatra_scraper.feature_engineering` module also provides a standalone converter for flight-results text. Place the text file in the repository root, then run:
+
+```powershell
+python -m yatra_scraper.feature_engineering flight_results.txt
+```
+
+By default, this creates `flight_results.csv` beside the input file. Choose a different output path with `--output`:
+
+```powershell
+python -m yatra_scraper.feature_engineering flight_results.txt --output parsed_flights.csv
+```
+
+If no input path is supplied, the converter looks for `flight_results.txt` in the current directory. The generated CSV includes parsed flight details and derived date and time features. This utility writes a new output file, so an existing file at the selected output path is replaced.
+
 ## Configuration
 
 Runtime settings are defined near the top of `yatra_scraper/main.py`. Common settings include:
 
 ```python
-DATE_COUNT = 45
+DATE_OFFSETS = (0, 6, 14, 29, 44)
 FARE_CLASSES = ("Economy", "Business")
-REQUEST_DELAY_MIN_SECONDS = 30
-REQUEST_DELAY_MAX_SECONDS = 60
+REQUEST_DELAY_MIN_SECONDS = 10
+REQUEST_DELAY_MAX_SECONDS = 15
 MAX_RETRIES = 3
 CHALLENGE_TIMEOUT_SECONDS = 30
+CHECKPOINT_RETRY_DELAY_SECONDS = 60
 ```
 
 Change configuration carefully. Lower request delays may reduce runtime but can increase the chance of rate limiting or CAPTCHA challenges.
@@ -236,8 +257,8 @@ kraken-scraper/
 The current implementation has been validated for:
 
 - Python syntax
-- 2,700 generated combinations
-- 45 consecutive dates
+- 300 generated combinations
+- Five requested date offsets
 - Economy and Business fare ordering
 - November month navigation logic
 - Checkpoint route/date/fare restoration
