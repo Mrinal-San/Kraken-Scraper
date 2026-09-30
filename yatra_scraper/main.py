@@ -51,9 +51,9 @@ REQUEST_DELAY_MIN_SECONDS = 10
 REQUEST_DELAY_MAX_SECONDS = 15
 DEPARTURE_DATE_INPUT_SELECTOR = '[aria-label="Departure date inputbox"]'
 
-OUTPUT_CSV_PATH = Path("Yatra_data.csv")
-CHECKPOINT_PATH = Path("yatra_scraper_checkpoint.json")
-PAUSE_FILE_PATH = Path("pause_scraper.pause")
+OUTPUT_CSV_PATH = Path("yatra_scraper/Yatra_data.csv")
+CHECKPOINT_PATH = Path("yatra_scraper/checkpoint.json")
+PAUSE_FILE_PATH = Path("yatra_scraper/pause_scraper.pause")
 PAUSE_POLL_INTERVAL_SECONDS = 0.25
 CHECKPOINT_RETRY_DELAY_SECONDS = 60
 
@@ -395,16 +395,6 @@ def scrape_permutation(page: Page, parameters: SearchParameters) -> list[dict]:
 	result_page = open_search_results(page)
 	wait_for_challenge_clearance(result_page)
 	flight_rows = collect_flights_while_scrolling(result_page, parameters.fare_class)
-
-	for row in flight_rows:
-		row.update(
-			{
-				"requested_origin": parameters.origin,
-				"requested_destination": parameters.destination,
-				"requested_departure_date": parameters.departure_date.isoformat(),
-				"requested_fare_class": parameters.fare_class,
-			}
-		)
 	return flight_rows
 
 

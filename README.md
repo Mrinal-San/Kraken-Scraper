@@ -172,7 +172,7 @@ The output contains flight details such as:
 - Departure date features
 - Selected fare class
 - Current price and currency
-- Requested origin, destination, date, and fare class
+- Full airport names derived from the departure and arrival airport codes
 - Scrape date and timestamp
 
 Rows are written after each successful permutation, reducing data loss if the job stops later.

@@ -7,14 +7,12 @@ from pathlib import Path
 CSV_COLUMNS = [
 	"airline",
 	"flight_number",
-	"aircraft",
 	"fare_class",
 	"departure_airport",
 	"departure_airport_code",
 	"arrival_airport",
 	"arrival_airport_code",
 	"stop_counts",
-	"layovers",
 	"departure_date",
 	"departure_time",
 	"arrival_time",
@@ -31,6 +29,15 @@ CSV_COLUMNS = [
 	"current_price",
 	"currency",
 ]
+
+AIRPORT_NAMES = {
+	"DEL": "Indira Gandhi International Airport",
+	"BOM": "Chhatrapati Shivaji Maharaj International Airport Mumbai",
+	"BLR": "Kempegowda International Airport Bengaluru",
+	"HYD": "Rajiv Gandhi International Airport",
+	"CCU": "Netaji Subhash Chandra Bose International Airport",
+	"MAA": "Chennai International Airport",
+}
 
 FLIGHT_NUMBER_RE = re.compile(r"^[A-Z0-9]{2,3}-\d{2,4}$", re.IGNORECASE)
 AIRPORT_RE = re.compile(r"^(.+?)\(([A-Z]{3})\)$")
@@ -88,9 +95,6 @@ def parse_flight_text(
 		arrival_time = lines[index + 9]
 		arrival_date_text = lines[index + 10]
 
-		# The export has airport labels one line after each route/date section.
-		departure_airport = lines[index + 5]
-		arrival_airport = lines[index + 11] if index + 11 < len(lines) else ""
 		price_index = index + 12
 		price_match = PRICE_RE.fullmatch(lines[price_index]) if price_index < len(lines) else None
 
@@ -116,9 +120,13 @@ def parse_flight_text(
 				"airline": airline,
 				"flight_number": flight_number,
 				"fare_class": fare_class,
-				"departure_airport": departure_airport,
+				"departure_airport": AIRPORT_NAMES.get(
+					origin_match.group(2), origin_match.group(1).strip()
+				),
 				"departure_airport_code": origin_match.group(2),
-				"arrival_airport": arrival_airport,
+				"arrival_airport": AIRPORT_NAMES.get(
+					destination_match.group(2), destination_match.group(1).strip()
+				),
 				"arrival_airport_code": destination_match.group(2),
 				"stop_counts": stop_count,
 				"departure_date": flight_date.isoformat(),
