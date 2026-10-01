@@ -43,7 +43,8 @@ CHALLENGE_TIMEOUT_SECONDS = 30
 CHALLENGE_POLL_INTERVAL_MS = 500
 MAX_SCROLL_ROUNDS = 60
 STABLE_BOTTOM_ROUNDS_REQUIRED = 3
-SCROLL_WAIT_MS = 700
+SCROLL_STEP_VIEWPORTS = 1.5
+SCROLL_WAIT_MS = 250
 RESULTS_WAIT_MS = 1500
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5
@@ -338,10 +339,10 @@ def collect_flights_while_scrolling(
 			flights_by_number.setdefault(row["flight_number"], row)
 
 		page.evaluate(
-			"""() => {
-				const step = Math.max(window.innerHeight * 0.8, 400);
+			f"""() => {{
+				const step = Math.max(window.innerHeight * {SCROLL_STEP_VIEWPORTS}, 600);
 				window.scrollBy(0, step);
-			}"""
+			}}"""
 		)
 		page.wait_for_timeout(SCROLL_WAIT_MS)
 
@@ -445,8 +446,8 @@ def is_checkpoint_access_denied(error: OSError) -> bool:
 		getattr(error, "winerror", None) == 5
 		and error.filename is not None
 		and error.filename2 is not None
-		and Path(error.filename).name == "yatra_scraper_checkpoint.tmp"
-		and Path(error.filename2).name == "yatra_scraper_checkpoint.json"
+		and Path(error.filename).name == "checkpoint.tmp"
+		and Path(error.filename2).name == "checkpoint.json"
 	)
 
 

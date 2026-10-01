@@ -79,6 +79,16 @@ The script automatically starts with:
 - The first configured airport route
 - Economy, then Business for each date
 
+### EaseMyTrip
+
+Run the EaseMyTrip scraper from the repository root:
+
+```powershell
+python -m easemytrip_scraper.main
+```
+
+It uses the same route/date/fare-class schedule, pause controls, retries, and checkpoint recovery. Results are appended to `easemytrip_scraper/Easemytrip_data.csv`; progress is stored in `easemytrip_scraper/checkpoint.json`.
+
 ## Iteration Order
 
 The generated order is deterministic:
