@@ -8,15 +8,15 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Iterator
 
-import pandas as pd
-from playwright.sync_api import Page
+from playwright.sync_api import Browser, Page
 from playwright.sync_api import sync_playwright
 
 if __package__:
-	from .feature_engineering import parse_flight_text
+	from .feature_engineering import process_raw_flight_texts_to_csv
 else:
-	from feature_engineering import parse_flight_text
+	from feature_engineering import process_raw_flight_texts_to_csv
 
 
 YATRA_URL = "https://www.yatra.com"
@@ -51,6 +51,28 @@ RETRY_BACKOFF_SECONDS = 5
 REQUEST_DELAY_MIN_SECONDS = 10
 REQUEST_DELAY_MAX_SECONDS = 15
 DEPARTURE_DATE_INPUT_SELECTOR = '[aria-label="Departure date inputbox"]'
+BODY_SELECTOR = "body"
+AIRPORT_INPUT_SELECTOR = "#input-with-icon-adornment"
+RESULTS_SEARCH_BUTTON_NAME = "Search"
+FARE_CLASS_INPUT_SELECTOR = '[aria-label="Travellers class inputbox"]'
+FARE_CLASS_DONE_BUTTON_NAME = "Done"
+LOCATION_FIELD_SELECTOR_TEMPLATE = '[role="Combobox"][aria-label^="{field_label}"]'
+DATE_PICKER_SELECTOR = ".react-datepicker"
+CALENDAR_MONTH_SELECTOR = ".react-datepicker__current-month"
+NEXT_MONTH_SELECTOR = (
+	'button[aria-label="Next Month"], '
+	'button.react-datepicker__navigation--next, '
+	'.react-datepicker__navigation--next'
+)
+CALENDAR_DAY_SELECTOR_TEMPLATE = (
+	'.react-datepicker__day:not(.react-datepicker__day--outside-month)'
+	'[aria-label="{date_label}"][aria-disabled="false"]'
+)
+FARE_CLASS_OPTION_SELECTOR_TEMPLATE = 'label[role="radio"][aria-label="{fare_class}"]'
+CHALLENGE_TITLE_MARKERS = ("challenge", "attention", "validation", "captcha")
+CHALLENGE_URL_MARKERS = ("akamai", "bot", "challenge", "captcha")
+PAGE_LOAD_STATE = "domcontentloaded"
+SCRAPER_WINDOW_TITLE = "Yatra scraper"
 
 OUTPUT_CSV_PATH = Path("yatra_scraper/Yatra_data.csv")
 CHECKPOINT_PATH = Path("yatra_scraper/checkpoint.json")
@@ -77,13 +99,14 @@ class ChallengeTimeoutError(RuntimeError):
 
 class PauseController:
 	def __init__(self, root: tk.Tk) -> None:
+		"""Create the pause/stop controls for a scraper run."""
 		self.root = root
 		self.paused = threading.Event()
 		self.stopped = threading.Event()
 		self.status_text = tk.StringVar(value="Running")
 		self.iteration_text = tk.StringVar(value="Preparing scraper...")
 
-		root.title("Yatra scraper")
+		root.title(SCRAPER_WINDOW_TITLE)
 		root.geometry("320x160")
 		root.resizable(False, False)
 		root.protocol("WM_DELETE_WINDOW", self.stop)
@@ -102,6 +125,7 @@ class PauseController:
 		self.pause_button.pack()
 
 	def toggle_pause(self) -> None:
+		"""Toggle the worker's pause event and update the button state."""
 		if self.paused.is_set():
 			self.paused.clear()
 			self.pause_button.config(text="Pause")
@@ -112,6 +136,7 @@ class PauseController:
 			self.status_text.set("Paused; waiting before the next request")
 
 	def set_iteration(self, iteration: int, total: int, details: str) -> None:
+		"""Show the current search on the Tk event loop."""
 		try:
 			self.root.after(
 				0,
@@ -123,18 +148,21 @@ class PauseController:
 			pass
 
 	def set_status(self, status: str) -> None:
+		"""Update the status label on the Tk event loop."""
 		try:
 			self.root.after(0, lambda: self.status_text.set(status))
 		except tk.TclError:
 			pass
 
 	def wait_if_paused(self) -> None:
+		"""Block the worker while paused or while the pause file exists."""
 		while self.paused.is_set() or PAUSE_FILE_PATH.exists():
 			if self.stopped.is_set():
 				return
 			self.stopped.wait(PAUSE_POLL_INTERVAL_SECONDS)
 
 	def wait_for_delay(self, seconds: float) -> bool:
+		"""Wait interruptibly, returning false after the user stops the run."""
 		deadline = time.monotonic() + seconds
 		while time.monotonic() < deadline:
 			self.wait_if_paused()
@@ -145,6 +173,7 @@ class PauseController:
 		return not self.stopped.is_set()
 
 	def stop(self) -> None:
+		"""Signal the worker to stop and close the control window."""
 		self.stopped.set()
 		self.paused.clear()
 		try:
@@ -162,6 +191,7 @@ class SearchParameters:
 
 
 def generate_search_parameters(start_date: date) -> list[SearchParameters]:
+	"""Build the bounded route, date, and fare-class search schedule."""
 	parameters = []
 	for origin in AIRPORTS:
 		for destination in AIRPORTS:
@@ -187,15 +217,17 @@ def generate_search_parameters(start_date: date) -> list[SearchParameters]:
 
 
 def is_challenge_page(page: Page) -> bool:
+	"""Return whether the current Yatra page appears to be a challenge screen."""
 	title = page.title().lower()
 	url = page.url.lower()
 	return (
-		any(marker in title for marker in ("challenge", "attention", "validation", "captcha"))
-		or any(marker in url for marker in ("akamai", "bot", "challenge", "captcha"))
+		any(marker in title for marker in CHALLENGE_TITLE_MARKERS)
+		or any(marker in url for marker in CHALLENGE_URL_MARKERS)
 	)
 
 
 def wait_for_challenge_clearance(page: Page) -> None:
+	"""Wait briefly for a user to clear a visible browser challenge."""
 	if not is_challenge_page(page):
 		return
 
@@ -216,28 +248,28 @@ def wait_for_challenge_clearance(page: Page) -> None:
 
 
 def select_location(page: Page, field_label: str, airport_code: str) -> None:
+	"""Select an airport in one of Yatra's location fields."""
 	if field_label:
-		page.locator(
-			f'[role="Combobox"][aria-label^="{field_label}"]'
-		).click()
+		page.locator(LOCATION_FIELD_SELECTOR_TEMPLATE.format(field_label=field_label)).click()
 
 	search_term = AIRPORT_SEARCH_TERMS[airport_code]
-	city_input = page.locator("#input-with-icon-adornment")
+	city_input = page.locator(AIRPORT_INPUT_SELECTOR)
 	city_input.fill(search_term)
 	page.get_by_text(search_term, exact=True).first.click()
 
 
 def select_departure_date(page: Page, departure_date: date) -> None:
+	"""Select a departure date from the Yatra calendar."""
 	date_input = page.locator(DEPARTURE_DATE_INPUT_SELECTOR)
 	if date_input.count():
 		date_input.click()
-	page.locator(".react-datepicker").first.wait_for(
+	page.locator(DATE_PICKER_SELECTOR).first.wait_for(
 		state="visible",
 		timeout=ELEMENT_TIMEOUT_MS,
 	)
 
 	target_month = (departure_date.year, departure_date.month)
-	calendar_month = page.locator(".react-datepicker__current-month").first
+	calendar_month = page.locator(CALENDAR_MONTH_SELECTOR).first
 	for _ in range(12):
 		visible_month = datetime.strptime(
 			calendar_month.inner_text().strip(),
@@ -251,11 +283,7 @@ def select_departure_date(page: Page, departure_date: date) -> None:
 				f"Calendar opened after target month for {departure_date.isoformat()}"
 			)
 
-		next_month = page.locator(
-			'button[aria-label="Next Month"], '
-			'button.react-datepicker__navigation--next, '
-			'.react-datepicker__navigation--next'
-		).filter(visible=True).first
+		next_month = page.locator(NEXT_MONTH_SELECTOR).filter(visible=True).first
 		if not next_month.count():
 			raise RetryableRequestError(
 				f"Next-month control was not visible for {departure_date.isoformat()}"
@@ -278,8 +306,7 @@ def select_departure_date(page: Page, departure_date: date) -> None:
 		f"{day}{ordinal}, {departure_date.year}"
 	)
 	calendar_day = page.locator(
-		f'.react-datepicker__day:not(.react-datepicker__day--outside-month)'
-		f'[aria-label="{date_label}"][aria-disabled="false"]'
+		CALENDAR_DAY_SELECTOR_TEMPLATE.format(date_label=date_label)
 	)
 
 	calendar_day.wait_for(state="visible", timeout=ELEMENT_TIMEOUT_MS)
@@ -290,24 +317,29 @@ def select_departure_date(page: Page, departure_date: date) -> None:
 
 
 def select_fare_class(page: Page, fare_class: str) -> None:
-	page.locator('[aria-label="Travellers class inputbox"]').click()
-	option = page.locator(f'label[role="radio"][aria-label="{fare_class}"]')
+	"""Select the requested cabin class from Yatra's traveller menu."""
+	page.locator(FARE_CLASS_INPUT_SELECTOR).click()
+	option = page.locator(
+		FARE_CLASS_OPTION_SELECTOR_TEMPLATE.format(fare_class=fare_class)
+	)
 	if not option.count():
 		option = page.get_by_text(fare_class, exact=True).first
 	option.click()
-	page.get_by_role("button", name="Done", exact=True).click()
+	page.get_by_role("button", name=FARE_CLASS_DONE_BUTTON_NAME, exact=True).click()
 
 
 def open_search_results(page: Page) -> Page:
-	opened_pages = []
+	"""Submit the search and return its results tab when a new tab opens."""
+	opened_pages: list[Page] = []
 	context = page.context
 
-	def capture_opened_page(opened_page):
+	def capture_opened_page(opened_page: Page) -> None:
+		"""Retain a popup page created by Yatra's search action."""
 		opened_pages.append(opened_page)
 
 	context.on("page", capture_opened_page)
 	try:
-		page.get_by_role("button", name="Search", exact=True).click()
+		page.get_by_role("button", name=RESULTS_SEARCH_BUTTON_NAME, exact=True).click()
 		page.wait_for_timeout(RESULTS_WAIT_MS)
 	finally:
 		context.remove_listener("page", capture_opened_page)
@@ -315,7 +347,7 @@ def open_search_results(page: Page) -> Page:
 	if opened_pages:
 		result_page = opened_pages[-1]
 		result_page.wait_for_load_state(
-			"domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS
+			PAGE_LOAD_STATE, timeout=PAGE_LOAD_TIMEOUT_MS
 		)
 		return result_page
 	return page
@@ -323,20 +355,17 @@ def open_search_results(page: Page) -> Page:
 
 def collect_flights_while_scrolling(
 	page: Page,
-	fare_class: str | None = None,
-) -> list[dict]:
-	flights_by_number = {}
+	) -> Iterator[str]:
+	"""Yield changing body text while scrolling through Yatra results."""
 	previous_height = None
-	previous_flight_count = 0
+	previous_page_text = None
 	stable_bottom_rounds = 0
 
 	for _ in range(MAX_SCROLL_ROUNDS):
-		page.locator("body").wait_for(state="visible", timeout=PAGE_LOAD_TIMEOUT_MS)
-		for row in parse_flight_text(
-			page.locator("body").inner_text(),
-			fare_class=fare_class,
-		):
-			flights_by_number.setdefault(row["flight_number"], row)
+		body = page.locator(BODY_SELECTOR)
+		body.wait_for(state="visible", timeout=PAGE_LOAD_TIMEOUT_MS)
+		page_text = body.inner_text()
+		yield page_text
 
 		page.evaluate(
 			f"""() => {{
@@ -345,12 +374,8 @@ def collect_flights_while_scrolling(
 			}}"""
 		)
 		page.wait_for_timeout(SCROLL_WAIT_MS)
-
-		for row in parse_flight_text(
-			page.locator("body").inner_text(),
-			fare_class=fare_class,
-		):
-			flights_by_number.setdefault(row["flight_number"], row)
+		page_text = body.inner_text()
+		yield page_text
 
 		metrics = page.evaluate(
 			"""() => ({
@@ -360,11 +385,10 @@ def collect_flights_while_scrolling(
 			})"""
 		)
 		at_bottom = metrics["y"] + metrics["viewport"] >= metrics["height"] - 4
-		flight_count = len(flights_by_number)
 		if (
 			at_bottom
 			and metrics["height"] == previous_height
-			and flight_count == previous_flight_count
+			and page_text == previous_page_text
 		):
 			stable_bottom_rounds += 1
 		else:
@@ -373,12 +397,11 @@ def collect_flights_while_scrolling(
 		if stable_bottom_rounds >= STABLE_BOTTOM_ROUNDS_REQUIRED:
 			break
 		previous_height = metrics["height"]
-		previous_flight_count = flight_count
-
-	return list(flights_by_number.values())
+		previous_page_text = page_text
 
 
-def scrape_permutation(page: Page, parameters: SearchParameters) -> list[dict]:
+def scrape_permutation(page: Page, parameters: SearchParameters) -> Iterator[str]:
+	"""Yield raw result-page text for one Yatra search."""
 	response = page.goto(
 		YATRA_URL,
 		wait_until="domcontentloaded",
@@ -395,24 +418,7 @@ def scrape_permutation(page: Page, parameters: SearchParameters) -> list[dict]:
 
 	result_page = open_search_results(page)
 	wait_for_challenge_clearance(result_page)
-	flight_rows = collect_flights_while_scrolling(result_page, parameters.fare_class)
-	return flight_rows
-
-
-def append_rows_to_csv(rows: list[dict], output_path: Path) -> int:
-	if not rows:
-		return 0
-
-	data_frame = pd.DataFrame(rows)
-	write_header = not output_path.exists() or output_path.stat().st_size == 0
-	data_frame.to_csv(
-		output_path,
-		mode="a",
-		header=write_header,
-		index=False,
-		encoding="utf-8-sig",
-	)
-	return len(data_frame)
+	yield from collect_flights_while_scrolling(result_page)
 
 
 def save_checkpoint(
@@ -420,6 +426,7 @@ def save_checkpoint(
 	next_iteration: int,
 	parameters: list[SearchParameters],
 ) -> None:
+	"""Atomically save the next search position for restart recovery."""
 	checkpoint = {
 		"start_date": start_date.isoformat(),
 		"next_iteration": next_iteration,
@@ -442,6 +449,7 @@ def save_checkpoint(
 
 
 def is_checkpoint_access_denied(error: OSError) -> bool:
+	"""Identify the Windows sharing violation for checkpoint replacement."""
 	return (
 		getattr(error, "winerror", None) == 5
 		and error.filename is not None
@@ -455,6 +463,7 @@ def load_checkpoint(
 	default_start_date: date,
 	total_iterations: int,
 ) -> tuple[date, int]:
+	"""Load a validated start date and next iteration from disk."""
 	if not CHECKPOINT_PATH.exists():
 		return default_start_date, 1
 
@@ -472,25 +481,14 @@ def load_checkpoint(
 	return default_start_date, 1
 
 
-def wait_if_paused() -> None:
-	if not PAUSE_FILE_PATH.exists():
-		return
-
-	print(
-		f"Paused because {PAUSE_FILE_PATH} exists. "
-		"Remove the file to resume."
-	)
-	while PAUSE_FILE_PATH.exists():
-		time.sleep(PAUSE_POLL_INTERVAL_SECONDS)
-	print("Pause file removed; resuming.")
-
-
 def scrape_with_retries(
-	browser,
+	browser: Browser,
 	parameters: SearchParameters,
 	request_number: int,
 	controller: PauseController,
 ) -> int:
+	"""Retry one search and persist its completed results."""
+	scrape_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
 	for attempt in range(1, MAX_RETRIES + 1):
 		delay = random.uniform(
 			REQUEST_DELAY_MIN_SECONDS,
@@ -507,8 +505,15 @@ def scrape_with_retries(
 		context = browser.new_context(user_agent=user_agent)
 		page = context.new_page()
 		try:
-			rows = scrape_permutation(page, parameters)
-			return append_rows_to_csv(rows, OUTPUT_CSV_PATH)
+			return process_raw_flight_texts_to_csv(
+				scrape_permutation(page, parameters),
+				OUTPUT_CSV_PATH,
+				fare_class=parameters.fare_class,
+				scrape_timestamp=scrape_timestamp,
+				departure_date=parameters.departure_date,
+				origin=parameters.origin,
+				destination=parameters.destination,
+			)
 		except ChallengeTimeoutError as error:
 			print(
 				f"Skipping {parameters.origin}-{parameters.destination} "
@@ -533,6 +538,7 @@ def scrape_with_retries(
 
 
 def run_scraper(controller: PauseController) -> None:
+	"""Run the scheduled Yatra searches with checkpoint recovery."""
 	default_start_date = date.today() + timedelta(days=1)
 	start_date, next_iteration = load_checkpoint(
 		default_start_date,
@@ -604,6 +610,7 @@ def run_scraper(controller: PauseController) -> None:
 
 
 def run_scraper_safely(controller: PauseController) -> None:
+	"""Restart after checkpoint sharing errors and report fatal worker errors."""
 	while not controller.stopped.is_set():
 		try:
 			run_scraper(controller)
@@ -628,6 +635,7 @@ def run_scraper_safely(controller: PauseController) -> None:
 
 
 def main() -> None:
+	"""Start the Tk controls and run scraping on a background thread."""
 	root = tk.Tk()
 	controller = PauseController(root)
 	worker = threading.Thread(

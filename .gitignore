@@ -7,3 +7,21 @@ __pycache__/
 
 # Local environment variables
 .env
+
+# local folder
+goibibo_scraper
+makemytrip_scraper
+.neon
+.env.local
+
+# Generated scraper data and runtime state
+*_data.csv
+**/checkpoint.json
+**/checkpoint.tmp
+**/pause_scraper.pause
+**/tempCodeRunnerFile.py
+
+# Local agent and editor integrations
+.agents/
+skills-lock.json
+/.vscode/mcp.json

@@ -1,7 +1,9 @@
 import csv
 import re
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Iterable, Iterator
 
 
 CSV_COLUMNS = [
@@ -29,6 +31,13 @@ CSV_COLUMNS = [
 	"current_price",
 	"currency",
 ]
+UNIQUE_ROW_KEY_FIELDS = (
+	"website",
+	"flight_number",
+	"departure_date",
+	"departure_time",
+	"scrape_timestamp",
+)
 
 AIRPORT_NAMES = {
 	"DEL": "Indira Gandhi International Airport",
@@ -56,10 +65,14 @@ def parse_flight_text(
 	departure_date: date | None = None,
 	today: date | None = None,
 	fare_class: str | None = None,
-) -> list[dict[str, str | int | bool]]:
+	scrape_timestamp: str | None = None,
+) -> Iterator[dict[str, str | int | bool]]:
+	"""Yield normalized flight rows parsed from EaseMyTrip result text."""
 	today = today or date.today()
 	departure_date = departure_date or today
-	scrape_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+	scrape_timestamp = scrape_timestamp or datetime.now().astimezone().isoformat(
+		timespec="seconds"
+	)
 	lines = [line.strip() for line in text.splitlines() if line.strip()]
 	rows = []
 
@@ -131,15 +144,80 @@ def parse_flight_text(
 		if price_match:
 			row["current_price"] = int(price_match.group(1).replace(",", ""))
 			row["currency"] = "INR"
-		rows.append(row)
-
-	return rows
+		yield row
 
 
 def write_flight_rows_to_csv(
-	rows: list[dict[str, str | int | bool]], output_path: Path
-) -> None:
+	rows: Iterable[dict[str, str | int | bool]], output_path: Path
+) -> int:
+	"""Write normalized flight rows to a new CSV file."""
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	row_count = 0
 	with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
 		writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
 		writer.writeheader()
-		writer.writerows(rows)
+		for row in rows:
+			writer.writerow(row)
+			row_count += 1
+	return row_count
+
+
+def append_flight_rows_to_csv(
+	rows: Iterable[dict[str, str | int | bool]], output_path: Path
+) -> int:
+	"""Stage a search result and append its unique rows to the CSV."""
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	row_count = 0
+	seen_keys: set[tuple[str, ...]] = set()
+	with tempfile.TemporaryFile(mode="w+t", newline="", encoding="utf-8") as staged_file:
+		staged_writer = csv.DictWriter(staged_file, fieldnames=CSV_COLUMNS)
+		staged_writer.writeheader()
+		for row in rows:
+			key = tuple(str(row.get(field, "")) for field in UNIQUE_ROW_KEY_FIELDS)
+			if not all(key) or key in seen_keys:
+				continue
+			staged_writer.writerow(row)
+			seen_keys.add(key)
+			row_count += 1
+
+		if not row_count:
+			return 0
+
+		staged_file.seek(0)
+		write_header = not output_path.exists() or output_path.stat().st_size == 0
+		with output_path.open("a", newline="", encoding="utf-8-sig") as csv_file:
+			reader = csv.DictReader(staged_file)
+			writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+			if write_header:
+				writer.writeheader()
+			writer.writerows(reader)
+	return row_count
+
+
+def process_raw_flight_texts_to_csv(
+	raw_texts: Iterable[str],
+	output_path: Path,
+	*,
+	fare_class: str,
+	scrape_timestamp: str,
+	departure_date: date,
+	origin: str | None = None,
+	destination: str | None = None,
+) -> int:
+	"""Parse raw result-card text and append filtered rows incrementally."""
+	def iter_rows() -> Iterator[dict[str, str | int | bool]]:
+		"""Yield filtered rows from the supplied flight-card texts."""
+		for raw_text in raw_texts:
+			for row in parse_flight_text(
+				raw_text,
+				departure_date=departure_date,
+				fare_class=fare_class,
+				scrape_timestamp=scrape_timestamp,
+			):
+				if origin and row["departure_airport_code"] != origin:
+					continue
+				if destination and row["arrival_airport_code"] != destination:
+					continue
+				yield row
+
+	return append_flight_rows_to_csv(iter_rows(), output_path)

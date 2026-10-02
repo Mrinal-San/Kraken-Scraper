@@ -1,0 +1,1 @@
+"""CSV-to-Neon flight fare ingestion pipeline."""

@@ -1,7 +1,9 @@
 import csv
 import re
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Iterable, Iterator
 
 
 CSV_COLUMNS = [
@@ -29,6 +31,13 @@ CSV_COLUMNS = [
 	"current_price",
 	"currency",
 ]
+UNIQUE_ROW_KEY_FIELDS = (
+	"website",
+	"flight_number",
+	"departure_date",
+	"departure_time",
+	"scrape_timestamp",
+)
 
 AIRPORT_NAMES = {
 	"DEL": "Indira Gandhi International Airport",
@@ -52,6 +61,7 @@ FARE_CLASS_RE = re.compile(
 
 
 def _departure_date(value: str, today: date) -> date:
+	"""Resolve a day/month label to its next matching calendar date."""
 	parsed = datetime.strptime(value, "%d %b").date()
 	candidate = parsed.replace(year=today.year)
 	if candidate < today:
@@ -60,6 +70,7 @@ def _departure_date(value: str, today: date) -> date:
 
 
 def _available_fare_classes(text: str) -> str:
+	"""Extract distinct fare class labels present in a result-page text."""
 	fare_classes = []
 	for match in FARE_CLASS_RE.finditer(text):
 		fare_class = match.group(1).title()
@@ -72,12 +83,16 @@ def parse_flight_text(
 	text: str,
 	today: date | None = None,
 	fare_class: str | None = None,
-) -> list[dict[str, str | int | bool]]:
+	departure_date: date | None = None,
+	scrape_timestamp: str | None = None,
+) -> Iterator[dict[str, str | int | bool]]:
+	"""Yield normalized flight rows found in one Yatra results page."""
 	today = today or date.today()
 	lines = [line.strip() for line in text.splitlines() if line.strip()]
 	fare_class = fare_class or _available_fare_classes(text)
-	scrape_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-	rows = []
+	scrape_timestamp = scrape_timestamp or datetime.now().astimezone().isoformat(
+		timespec="seconds"
+	)
 
 	for index, flight_number in enumerate(lines):
 		if not FLIGHT_NUMBER_RE.fullmatch(flight_number) or index == 0:
@@ -109,7 +124,7 @@ def parse_flight_text(
 		):
 			continue
 
-		flight_date = _departure_date(departure_date_text, today)
+		flight_date = departure_date or _departure_date(departure_date_text, today)
 		stops_match = re.search(r"\d+", stops_text)
 		stop_count = 0 if "non stop" in stops_text.lower() else (
 			int(stops_match.group()) if stops_match else ""
@@ -146,25 +161,89 @@ def parse_flight_text(
 		if price_match:
 			row["current_price"] = int(price_match.group(2).replace(",", ""))
 			row["currency"] = "INR"
-		rows.append(row)
-
-	return rows
+		yield row
 
 
 def convert_flight_text_to_csv(input_path: Path, output_path: Path) -> int:
+	"""Convert a saved Yatra results-text file to a normalized CSV."""
 	text = input_path.read_text(encoding="utf-8")
-	rows = parse_flight_text(text)
-	write_flight_rows_to_csv(rows, output_path)
-	return len(rows)
+	return write_flight_rows_to_csv(parse_flight_text(text), output_path)
 
 
 def write_flight_rows_to_csv(
-	rows: list[dict[str, str | int | bool]], output_path: Path
-) -> None:
+	rows: Iterable[dict[str, str | int | bool]], output_path: Path
+) -> int:
+	"""Write a normalized CSV, replacing any existing output file."""
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	row_count = 0
 	with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
 		writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
 		writer.writeheader()
-		writer.writerows(rows)
+		for row in rows:
+			writer.writerow(row)
+			row_count += 1
+	return row_count
+
+
+def append_flight_rows_to_csv(
+	rows: Iterable[dict[str, str | int | bool]], output_path: Path
+) -> int:
+	"""Stage and append unique rows without materializing a full search in memory."""
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	row_count = 0
+	seen_keys: set[tuple[str, ...]] = set()
+	with tempfile.TemporaryFile(mode="w+t", newline="", encoding="utf-8") as staged_file:
+		staged_writer = csv.DictWriter(staged_file, fieldnames=CSV_COLUMNS)
+		staged_writer.writeheader()
+		for row in rows:
+			key = tuple(str(row.get(field, "")) for field in UNIQUE_ROW_KEY_FIELDS)
+			if not all(key) or key in seen_keys:
+				continue
+			staged_writer.writerow(row)
+			seen_keys.add(key)
+			row_count += 1
+
+		if not row_count:
+			return 0
+
+		staged_file.seek(0)
+		write_header = not output_path.exists() or output_path.stat().st_size == 0
+		with output_path.open("a", newline="", encoding="utf-8-sig") as csv_file:
+			reader = csv.DictReader(staged_file)
+			writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+			if write_header:
+				writer.writeheader()
+			writer.writerows(reader)
+	return row_count
+
+
+def process_raw_flight_texts_to_csv(
+	raw_texts: Iterable[str],
+	output_path: Path,
+	*,
+	fare_class: str,
+	scrape_timestamp: str,
+	departure_date: date | None = None,
+	origin: str | None = None,
+	destination: str | None = None,
+) -> int:
+	"""Parse raw result-page text and append unique flight rows incrementally."""
+	def iter_rows() -> Iterator[dict[str, str | int | bool]]:
+		"""Yield filtered, locally unique rows from the supplied page texts."""
+		for raw_text in raw_texts:
+			for row in parse_flight_text(
+				raw_text,
+				fare_class=fare_class,
+				departure_date=departure_date,
+				scrape_timestamp=scrape_timestamp,
+			):
+				if origin and row["departure_airport_code"] != origin:
+					continue
+				if destination and row["arrival_airport_code"] != destination:
+					continue
+				yield row
+
+	return append_flight_rows_to_csv(iter_rows(), output_path)
 
 
 if __name__ == "__main__":
