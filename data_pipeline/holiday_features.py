@@ -26,6 +26,21 @@ VARIABLE_FESTIVALS: dict[int, dict[str, date]] = {
 	},
 }
 
+# Additional user-configured dates and inclusive date ranges.
+EXTRA_HOLIDAY_SEASON_DATES = frozenset(
+	{
+		date(2026, 10, 2),
+		date(2026, 11, 15),
+		date(2026, 12, 25),
+		date(2026, 12, 31),
+		date(2027, 1, 1),
+	}
+)
+EXTRA_HOLIDAY_SEASON_RANGES = (
+	(date(2026, 10, 11), date(2026, 10, 20)),
+	(date(2026, 11, 6), date(2026, 11, 10)),
+)
+
 PEAK_TRAVEL_MONTHS = frozenset({1, 5, 6, 7, 12})
 
 # Weekday numbers follow datetime.date.weekday(): Monday=0, Sunday=6.
@@ -67,10 +82,16 @@ def _long_weekend_bridge_dates(holidays: list[date]) -> set[date]:
 	return bridge_dates
 
 
+def _is_extra_holiday_season_date(day: date) -> bool:
+	return day in EXTRA_HOLIDAY_SEASON_DATES or any(
+		start <= day <= end for start, end in EXTRA_HOLIDAY_SEASON_RANGES
+	)
+
+
 def is_holiday_or_peak(target_date: DateLike) -> bool:
 	"""Return whether a date is a configured holiday, peak season, or bridge day."""
 	day = _as_date(target_date)
-	if day.month in PEAK_TRAVEL_MONTHS:
+	if day.month in PEAK_TRAVEL_MONTHS or _is_extra_holiday_season_date(day):
 		return True
 
 	holidays = _holiday_dates(day.year - 1, day.year + 1)
@@ -108,6 +129,11 @@ def add_holiday_features(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
 	feature_flags = parsed_dates.dt.month.isin(PEAK_TRAVEL_MONTHS).to_numpy().copy()
 
 	if not valid_dates.empty:
+		feature_flags[valid_positions] |= np.fromiter(
+			(_is_extra_holiday_season_date(day) for day in valid_dates.dt.date),
+			dtype=bool,
+			count=len(valid_dates),
+		)
 		first_year = int(valid_dates.dt.year.min())
 		last_year = int(valid_dates.dt.year.max())
 		holiday_dates = _holiday_dates(first_year - 1, last_year + 1)

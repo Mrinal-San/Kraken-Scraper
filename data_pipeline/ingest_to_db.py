@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 from psycopg2.pool import SimpleConnectionPool
 
+from data_pipeline.holiday_features import (
+	EXTRA_HOLIDAY_SEASON_DATES,
+	EXTRA_HOLIDAY_SEASON_RANGES,
+	is_holiday_or_peak,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CSV_PATHS = (
@@ -71,7 +77,6 @@ STRING_COLUMNS = frozenset(
 		"arrival_airport_code",
 		"flight_duration",
 		"day_of_week",
-		"holiday_season",
 		"website",
 		"currency",
 	}
@@ -81,7 +86,7 @@ INTEGER_COLUMNS = frozenset(
 )
 DATE_COLUMNS = frozenset({"departure_date", "scrape_date"})
 TIME_COLUMNS = frozenset({"departure_time", "arrival_time"})
-BOOLEAN_COLUMNS = frozenset({"is_weekend"})
+BOOLEAN_COLUMNS = frozenset({"is_weekend", "holiday_season"})
 
 COMMON_HEADER_ALIASES = {
 	"airline": "airline",
@@ -153,7 +158,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 	day_of_week VARCHAR(12),
 	month_of_year SMALLINT,
 	is_weekend BOOLEAN,
-	holiday_season VARCHAR(80),
+	holiday_season BOOLEAN,
 	scrape_date DATE,
 	scrape_timestamp TIMESTAMPTZ NOT NULL,
 	days_until_departure INTEGER,
@@ -165,11 +170,54 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 	)
 )
 """
+MIGRATE_HOLIDAY_SEASON_SQL = f"""
+DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+			AND table_name = '{TABLE_NAME}'
+			AND column_name = 'holiday_season'
+			AND data_type <> 'boolean'
+	) THEN
+		ALTER TABLE {TABLE_NAME}
+		ALTER COLUMN holiday_season TYPE BOOLEAN
+		USING CASE
+			WHEN lower(trim(holiday_season::text)) IN ('true', 't', 'yes', 'y', '1')
+				THEN TRUE
+			WHEN lower(trim(holiday_season::text)) IN ('false', 'f', 'no', 'n', '0')
+				THEN FALSE
+			ELSE NULL
+		END;
+	END IF;
+END
+$$
+"""
 INSERT_SQL = f"""
 INSERT INTO {TABLE_NAME} ({", ".join(CSV_COLUMNS)})
 VALUES %s
 ON CONFLICT ON CONSTRAINT {UNIQUE_CONSTRAINT_NAME} DO NOTHING
 RETURNING id
+"""
+BACKFILL_HOLIDAY_SEASON_SQL = f"""
+SELECT id, departure_date
+FROM {TABLE_NAME}
+WHERE id > %s
+	AND (
+		holiday_season IS NULL
+		OR departure_date = ANY(%s::date[])
+		OR departure_date BETWEEN %s AND %s
+		OR departure_date BETWEEN %s AND %s
+	)
+ORDER BY id
+LIMIT %s
+"""
+UPDATE_HOLIDAY_SEASON_SQL = f"""
+UPDATE {TABLE_NAME} AS fares
+SET holiday_season = updates.holiday_season
+FROM (VALUES %s) AS updates (id, holiday_season)
+WHERE fares.id = updates.id
 """
 
 logger = logging.getLogger(__name__)
@@ -286,6 +334,11 @@ def iter_csv_rows(path: Path) -> Iterator[tuple[object | None, ...]]:
 			if any(record.get(column) is None for column in REQUIRED_COLUMNS):
 				logger.warning("Skipping row %d in %s with incomplete identity", row_number, path)
 				continue
+			departure_date = record["departure_date"]
+			if not isinstance(departure_date, date):
+				logger.warning("Skipping row %d in %s with invalid departure date", row_number, path)
+				continue
+			record["holiday_season"] = is_holiday_or_peak(departure_date)
 			yield tuple(record.get(column) for column in CSV_COLUMNS)
 
 
@@ -331,6 +384,52 @@ def _insert_batch(
 				return len(cursor.fetchall())
 	finally:
 		connection_pool.putconn(connection)
+
+
+def _backfill_holiday_season(
+	connection_pool: SimpleConnectionPool,
+	batch_size: int,
+) -> int:
+	"""Populate missing holiday flags for rows already stored in Neon."""
+	connection = connection_pool.getconn()
+	updated_rows = 0
+	try:
+		with connection:
+			with connection.cursor() as cursor:
+				last_id = 0
+				while True:
+					cursor.execute(
+						BACKFILL_HOLIDAY_SEASON_SQL,
+						(
+							last_id,
+							sorted(EXTRA_HOLIDAY_SEASON_DATES),
+							*(
+								date_value
+								for date_range in EXTRA_HOLIDAY_SEASON_RANGES
+								for date_value in date_range
+							),
+							batch_size,
+						),
+					)
+					rows = cursor.fetchall()
+					if not rows:
+						break
+					last_id = rows[-1][0]
+					updates = [
+						(row_id, is_holiday_or_peak(departure_date))
+						for row_id, departure_date in rows
+					]
+					execute_values(
+						cursor,
+						UPDATE_HOLIDAY_SEASON_SQL,
+						updates,
+						page_size=len(updates),
+					)
+					updated_rows += len(updates)
+	finally:
+		connection_pool.putconn(connection)
+	logger.info("Backfilled holiday_season for %d existing row(s)", updated_rows)
+	return updated_rows
 
 
 def ingest_csv(
@@ -395,6 +494,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 			get_database_url(),
 		)
 		_execute(connection_pool, CREATE_TABLE_SQL)
+		_execute(connection_pool, MIGRATE_HOLIDAY_SEASON_SQL)
+		_backfill_holiday_season(connection_pool, args.batch_size)
 		inserted_rows = sum(
 			ingest_csv(path, connection_pool, args.batch_size)
 			for path in existing_paths

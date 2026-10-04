@@ -140,13 +140,13 @@ To start a fresh full run, remove the relevant checkpoint. To start with a fresh
 
 ## Data Pipeline
 
-`data_pipeline/ingest_to_db.py` is the single database entry point. It uses Python's `csv` module for streaming input, `psycopg2` for PostgreSQL, and `python-dotenv` for local environment files. It maps source headers to the `flight_fares` schema, parses dates/times/prices/booleans, skips rows missing required identity fields, and logs skipped or inserted records.
+`data_pipeline/ingest_to_db.py` is the single database entry point. It uses Python's `csv` module for streaming input, `psycopg2` for PostgreSQL, and `python-dotenv` for local environment files. It maps source headers to the `flight_fares` schema, parses dates/times/prices/booleans, skips rows missing required identity fields, and logs skipped or inserted records. `holiday_season` is stored as a boolean derived from `departure_date`; ingestion also converts an older text column, fills existing `NULL` flags, and refreshes values for the additional configured dates/ranges.
 
 The table has a unique constraint on `(website, flight_number, departure_date, departure_time, scrape_timestamp)`. The insert uses `ON CONFLICT DO NOTHING`, so rerunning ingestion does not duplicate rows with the same identity. Adjust the memory/round-trip tradeoff with `--batch-size`.
 
 ### Holiday features
 
-`data_pipeline/holiday_features.py` provides separate date features for model preparation. It adds `is_holiday_season` and `days_to_nearest_holiday` to a Pandas DataFrame, using configured fixed holidays, 2025/2026 Holi and Diwali dates, peak travel months, and long-weekend bridge days. It can be tested with:
+`data_pipeline/holiday_features.py` provides separate date features for model preparation. It adds `is_holiday_season` and `days_to_nearest_holiday` to a Pandas DataFrame, using configured fixed holidays, 2025/2026 Holi and Diwali dates, peak travel months, long-weekend bridge days, and the additional 2026/2027 dates and ranges. It can be tested with:
 
 ```powershell
 python -m data_pipeline.holiday_features
